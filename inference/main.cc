@@ -1,6 +1,6 @@
-#include "include/json.hpp"
 #include <algorithm>
 #include <cassert>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <fstream>
@@ -9,7 +9,6 @@
 #include <map>
 #include <numeric>
 #include <random>
-#include <span>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -24,6 +23,25 @@ constexpr int VOCAB_SIZE = 50257;
 constexpr int CONTEXT_LENGTH = 1024;
 
 using tensor = std::vector<float>;
+
+class FloatSpan {
+public:
+  FloatSpan(const float *data, size_t size) : data_(data), size_(size) {}
+  FloatSpan(const tensor &values) : data_(values.data()), size_(values.size()) {}
+
+  const float *begin() const { return data_; }
+  const float *end() const { return data_ + size_; }
+  size_t size() const { return size_; }
+  const float &operator[](size_t index) const { return data_[index]; }
+  FloatSpan subspan(size_t offset, size_t count) const {
+    assert(offset <= size_ && count <= size_ - offset);
+    return FloatSpan(data_ + offset, count);
+  }
+
+private:
+  const float *data_;
+  size_t size_;
+};
 
 struct TransformerInput {
   tensor qWeights, kWeights, vWeights;
@@ -131,14 +149,14 @@ struct gptWeights {
 };
 
 float gelu(float x) {
-
+  constexpr float pi = 3.14159265358979323846f;
   return 0.5f * x *
-         (1.0f + std::tanh(std::sqrt(2.0f / static_cast<float>(M_PI)) *
+         (1.0f + std::tanh(std::sqrt(2.0f / pi) *
                            (x + 0.044715f * x * x * x)));
 }
 
-std::vector<float> matMul(std::span<const float> a, int an, int am,
-                          std::span<const float> b, int bn, int bm) {
+std::vector<float> matMul(FloatSpan a, int an, int am, FloatSpan b, int bn,
+                          int bm) {
   assert(am == bn);
   std::vector<float> result(an * bm, 0.0f);
 
@@ -152,7 +170,7 @@ std::vector<float> matMul(std::span<const float> a, int an, int am,
   return result;
 }
 
-std::vector<float> transpose(std::span<const float> a, int n, int m) {
+std::vector<float> transpose(FloatSpan a, int n, int m) {
   std::vector<float> result(n * m);
   for (int i = 0; i < n; i++)
     for (int j = 0; j < m; j++)
@@ -160,7 +178,7 @@ std::vector<float> transpose(std::span<const float> a, int n, int m) {
   return result;
 }
 
-float dotProduct(std::span<const float> a, std::span<const float> b) {
+float dotProduct(FloatSpan a, FloatSpan b) {
   assert(a.size() == b.size());
   float result = 0.0f;
   for (size_t i = 0; i < a.size(); i++)
@@ -168,7 +186,7 @@ float dotProduct(std::span<const float> a, std::span<const float> b) {
   return result;
 }
 
-tensor addVectors(std::span<const float> a, std::span<const float> b) {
+tensor addVectors(FloatSpan a, FloatSpan b) {
   assert(a.size() == b.size());
   tensor result(a.begin(), a.end());
   for (size_t i = 0; i < a.size(); i++)
@@ -176,9 +194,7 @@ tensor addVectors(std::span<const float> a, std::span<const float> b) {
   return result;
 }
 
-tensor layerNorm(std::span<const float> ogEmbeddings,
-                 std::span<const float> weights,
-                 std::span<const float> biases) {
+tensor layerNorm(FloatSpan ogEmbeddings, FloatSpan weights, FloatSpan biases) {
   assert(ogEmbeddings.size() == weights.size());
   assert(ogEmbeddings.size() == biases.size());
 
@@ -205,7 +221,7 @@ tensor layerNorm(std::span<const float> ogEmbeddings,
   return output;
 }
 
-tensor softmax(std::span<const float> input) {
+tensor softmax(FloatSpan input) {
   const int n = static_cast<int>(input.size());
   float mx = *std::max_element(input.begin(), input.end());
 
@@ -221,8 +237,7 @@ tensor softmax(std::span<const float> input) {
 }
 
 // HF Conv1D: y = x @ W + b, W stored (in, out) row-major
-tensor forwardPass(std::span<const float> weights,
-                   std::span<const float> biases, std::span<const float> inputs,
+tensor forwardPass(FloatSpan weights, FloatSpan biases, FloatSpan inputs,
                    bool useGelu = false) {
   const int outDim = static_cast<int>(biases.size());
   const int inDim = static_cast<int>(inputs.size());
@@ -241,12 +256,10 @@ tensor forwardPass(std::span<const float> weights,
   return output;
 }
 
-tensor attention(std::span<const float> embeddings, int numTokens, int embedDim,
-                 int headDim, int headIdx, std::span<const float> qWeights,
-                 std::span<const float> kWeights,
-                 std::span<const float> vWeights,
-                 std::span<const float> qBiases, std::span<const float> kBiases,
-                 std::span<const float> vBiases) {
+tensor attention(FloatSpan embeddings, int numTokens, int embedDim, int headDim,
+                 int headIdx, FloatSpan qWeights, FloatSpan kWeights,
+                 FloatSpan vWeights, FloatSpan qBiases, FloatSpan kBiases,
+                 FloatSpan vBiases) {
   tensor qProjections(numTokens * headDim);
   tensor kProjections(numTokens * headDim);
   tensor vProjections(numTokens * headDim);
@@ -285,7 +298,7 @@ tensor attention(std::span<const float> embeddings, int numTokens, int embedDim,
       scores[i * numTokens + j] = -std::numeric_limits<float>::infinity();
 
   for (int i = 0; i < numTokens; i++) {
-    auto row = std::span<const float>(scores).subspan(i * numTokens, numTokens);
+    auto row = FloatSpan(scores).subspan(i * numTokens, numTokens);
     auto softrow = softmax(row);
     for (int j = 0; j < numTokens; j++)
       scores[i * numTokens + j] = softrow[j];
@@ -296,11 +309,9 @@ tensor attention(std::span<const float> embeddings, int numTokens, int embedDim,
 
 tensor multiHeadAttention(
     int numTokens, int embedDim, int heads, int headDim,
-    std::span<const float> embeddings, std::span<const float> qWeights,
-    std::span<const float> kWeights, std::span<const float> vWeights,
-    std::span<const float> qBiases, std::span<const float> kBiases,
-    std::span<const float> vBiases, std::span<const float> oWeights,
-    std::span<const float> oBiases) {
+    FloatSpan embeddings, FloatSpan qWeights, FloatSpan kWeights,
+    FloatSpan vWeights, FloatSpan qBiases, FloatSpan kBiases,
+    FloatSpan vBiases, FloatSpan oWeights, FloatSpan oBiases) {
   tensor concat(numTokens * embedDim, 0.0f);
 
   for (int h = 0; h < heads; h++) {
@@ -323,9 +334,9 @@ tensor multiHeadAttention(
   return projected;
 }
 
-tensor mlp(int numTokens, int dimensions, std::span<const float> embeddings,
-           std::span<const float> l1Weights, std::span<const float> l1Biases,
-           std::span<const float> l2Weights, std::span<const float> l2Biases) {
+tensor mlp(int numTokens, int dimensions, FloatSpan embeddings,
+           FloatSpan l1Weights, FloatSpan l1Biases, FloatSpan l2Weights,
+           FloatSpan l2Biases) {
   tensor result(numTokens * dimensions);
   for (int i = 0; i < numTokens; i++) {
     auto tokenEmb = embeddings.subspan(i * dimensions, dimensions);
@@ -342,7 +353,7 @@ tensor transformer(const TransformerInput &input, int numTokens,
   tensor normedAttn(numTokens * EMBEDDING_DIMENSION);
   for (int i = 0; i < numTokens; i++) {
     auto tokenEmbedding =
-        std::span<const float>(embeddings)
+        FloatSpan(embeddings)
             .subspan(i * EMBEDDING_DIMENSION, EMBEDDING_DIMENSION);
     auto normed =
         layerNorm(tokenEmbedding, input.lnAttnWeights, input.lnAttnBiases);
@@ -359,7 +370,7 @@ tensor transformer(const TransformerInput &input, int numTokens,
 
   tensor normedMlp(numTokens * EMBEDDING_DIMENSION);
   for (int i = 0; i < numTokens; i++) {
-    auto token = std::span<const float>(residual1).subspan(
+    auto token = FloatSpan(residual1).subspan(
         i * EMBEDDING_DIMENSION, EMBEDDING_DIMENSION);
     auto normed = layerNorm(token, input.lnMlpWeights, input.lnMlpBiases);
     for (int j = 0; j < EMBEDDING_DIMENSION; j++)
@@ -583,48 +594,148 @@ std::string getTokenFromTokenId(int tokenId) {
   return gpt2Tokens[tokenId];
 }
 
-void parseMerges(const nlohmann::json &model) {
-  merges.clear();
-  const auto &m = model.at("merges");
-  int rank = 0;
-  for (const auto &entry : m) {
-    if (entry.is_array() && entry.size() == 2) {
-      merges[{entry[0].get<std::string>(), entry[1].get<std::string>()}] =
-          rank++;
-    } else if (entry.is_string()) {
-      std::string s = entry.get<std::string>();
-      auto sp = s.find(' ');
-      if (sp != std::string::npos)
-        merges[{s.substr(0, sp), s.substr(sp + 1)}] = rank++;
+void skipJsonWhitespace(const std::string &json, size_t &pos) {
+  while (pos < json.size() && std::isspace(static_cast<unsigned char>(json[pos])))
+    pos++;
+}
+
+std::string parseJsonString(const std::string &json, size_t &pos) {
+  if (pos >= json.size() || json[pos] != '"')
+    throw std::runtime_error("expected JSON string");
+  pos++;
+
+  std::string result;
+  while (pos < json.size()) {
+    char c = json[pos++];
+    if (c == '"')
+      return result;
+    if (c != '\\') {
+      result.push_back(c);
+      continue;
     }
+
+    if (pos >= json.size())
+      break;
+    const char escape = json[pos++];
+    switch (escape) {
+    case '"': result.push_back('"'); break;
+    case '\\': result.push_back('\\'); break;
+    case '/': result.push_back('/'); break;
+    case 'b': result.push_back('\b'); break;
+    case 'f': result.push_back('\f'); break;
+    case 'n': result.push_back('\n'); break;
+    case 'r': result.push_back('\r'); break;
+    case 't': result.push_back('\t'); break;
+    case 'u': {
+      unsigned int codepoint = 0;
+      for (int i = 0; i < 4 && pos < json.size(); i++) {
+        const char digit = json[pos++];
+        codepoint <<= 4;
+        if (digit >= '0' && digit <= '9')
+          codepoint += digit - '0';
+        else if (digit >= 'a' && digit <= 'f')
+          codepoint += digit - 'a' + 10;
+        else if (digit >= 'A' && digit <= 'F')
+          codepoint += digit - 'A' + 10;
+        else
+          throw std::runtime_error("invalid JSON unicode escape");
+      }
+      result += utf8Encode(static_cast<char32_t>(codepoint));
+      break;
+    }
+    default:
+      throw std::runtime_error("invalid JSON escape");
+    }
+  }
+  throw std::runtime_error("unterminated JSON string");
+}
+
+size_t findJsonValue(const std::string &json, const std::string &key) {
+  const std::string marker = "\"" + key + "\"";
+  const size_t keyPos = json.find(marker);
+  if (keyPos == std::string::npos)
+    throw std::runtime_error("missing JSON key: " + key);
+  const size_t colon = json.find(':', keyPos + marker.size());
+  if (colon == std::string::npos)
+    throw std::runtime_error("missing JSON colon: " + key);
+  size_t valuePos = colon + 1;
+  skipJsonWhitespace(json, valuePos);
+  return valuePos;
+}
+
+void parseMerges(const std::string &json) {
+  merges.clear();
+  size_t pos = findJsonValue(json, "merges");
+  if (pos >= json.size() || json[pos] != '[')
+    throw std::runtime_error("invalid JSON merges array");
+  pos++;
+
+  int rank = 0;
+  while (true) {
+    skipJsonWhitespace(json, pos);
+    if (pos < json.size() && json[pos] == ']')
+      break;
+    if (pos >= json.size() || json[pos] != '[')
+      throw std::runtime_error("invalid JSON merge entry");
+    pos++;
+    skipJsonWhitespace(json, pos);
+    const std::string first = parseJsonString(json, pos);
+    skipJsonWhitespace(json, pos);
+    if (pos >= json.size() || json[pos++] != ',')
+      throw std::runtime_error("invalid JSON merge pair");
+    skipJsonWhitespace(json, pos);
+    const std::string second = parseJsonString(json, pos);
+    skipJsonWhitespace(json, pos);
+    if (pos >= json.size() || json[pos++] != ']')
+      throw std::runtime_error("invalid JSON merge pair");
+    merges[{first, second}] = rank++;
+    skipJsonWhitespace(json, pos);
+    if (pos < json.size() && json[pos] == ',')
+      pos++;
   }
 }
 
 void loadVocab() {
-  using json = nlohmann::json;
   std::ifstream f("../weights/tokenizer/tokenizer.json");
   if (!f) {
     std::cerr << "failed to open tokenizer.json\n";
     std::exit(1);
   }
-  const json data = json::parse(f);
-  const json &model = data.at("model");
+  const std::string json((std::istreambuf_iterator<char>(f)),
+                         std::istreambuf_iterator<char>());
 
   buildByteEncoder();
 
   gpt2Tokens.assign(VOCAB_SIZE, "");
   gpt2TokenToTokenId.clear();
-  for (auto it = model.at("vocab").begin(); it != model.at("vocab").end();
-       ++it) {
-    const std::string token = it.key();
-    const int id = it.value().get<int>();
+  size_t pos = findJsonValue(json, "vocab");
+  if (pos >= json.size() || json[pos] != '{')
+    throw std::runtime_error("invalid JSON vocab object");
+  pos++;
+  while (true) {
+    skipJsonWhitespace(json, pos);
+    if (pos < json.size() && json[pos] == '}')
+      break;
+    const std::string token = parseJsonString(json, pos);
+    skipJsonWhitespace(json, pos);
+    if (pos >= json.size() || json[pos++] != ':')
+      throw std::runtime_error("invalid JSON vocab entry");
+    skipJsonWhitespace(json, pos);
+    size_t valueEnd = pos;
+    while (valueEnd < json.size() && std::isdigit(static_cast<unsigned char>(json[valueEnd])))
+      valueEnd++;
+    const int id = std::stoi(json.substr(pos, valueEnd - pos));
+    pos = valueEnd;
     if (id >= 0 && id < VOCAB_SIZE) {
       gpt2Tokens[id] = token;
       gpt2TokenToTokenId[token] = id;
     }
+    skipJsonWhitespace(json, pos);
+    if (pos < json.size() && json[pos] == ',')
+      pos++;
   }
 
-  parseMerges(model);
+  parseMerges(json);
   std::cerr << "tokenizer loaded: vocab=" << gpt2TokenToTokenId.size()
             << " merges=" << merges.size() << "\n";
 }
@@ -693,8 +804,8 @@ tensor forwardModel(const gptWeights &weights,
   // final layer norm
   tensor normed(numTokens * EMBEDDING_DIMENSION);
   for (int i = 0; i < numTokens; i++) {
-    auto token = std::span<const float>(hidden).subspan(i * EMBEDDING_DIMENSION,
-                                                        EMBEDDING_DIMENSION);
+    auto token = FloatSpan(hidden).subspan(i * EMBEDDING_DIMENSION,
+                         EMBEDDING_DIMENSION);
     auto n = layerNorm(token, weights.finalWeights, weights.finalBiases);
     for (int j = 0; j < EMBEDDING_DIMENSION; j++)
       normed[i * EMBEDDING_DIMENSION + j] = n[j];
@@ -706,7 +817,7 @@ tensor logitsForLastToken(const gptWeights &weights, const tensor &normedHidden,
                           int numTokens) {
   // tied LM head: logits = hidden @ wte^T
   auto last =
-      std::span<const float>(normedHidden)
+      FloatSpan(normedHidden)
           .subspan((numTokens - 1) * EMBEDDING_DIMENSION, EMBEDDING_DIMENSION);
   tensor logits(VOCAB_SIZE);
   for (int v = 0; v < VOCAB_SIZE; v++) {
