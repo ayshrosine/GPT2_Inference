@@ -1,15 +1,5 @@
 
 
-
-
-
-
-
-
-
-
-
-
 int main() {
 
     // load weights
